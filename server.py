@@ -93,18 +93,16 @@ def crc32c_hex(data: bytes) -> str:
     return f"{val:08x}".lower()
 
 def canonicalize_text(text: str) -> str:
-    norm = unicodedata.normalize("NFKC", text).lower()
-    tokens = norm.split()
-    return " ".join(tokens)
+    # Unicode NFKC, lowercase, trim, and collapse Unicode whitespace to one ASCII space
+    norm = unicodedata.normalize("NFKC", text).lower().strip()
+    tokens = re.split(r"\s+", norm, flags=re.UNICODE)
+    return " ".join([t for t in tokens if t])
 
 def get_word_set(text: str) -> set:
-    words = re.findall(r"\w+", text, re.UNICODE)
-    cleaned = set()
-    for w in words:
-        w_clean = "".join(c for c in w if c.isalnum())
-        if w_clean:
-            cleaned.add(w_clean)
-    return cleaned
+    # lowercase Unicode letter/number word-set
+    norm = unicodedata.normalize("NFKC", text).lower()
+    words = re.findall(r"[^\W_]+", norm, flags=re.UNICODE)
+    return set(words)
 
 def jaccard_similarity(set1: set, set2: set) -> float:
     if not set1 and not set2:
@@ -151,45 +149,51 @@ async def build_corpus(request: Request):
     
     for obj_idx, obj in enumerate(objects):
         obj_codes = set()
-        uri = obj.get("uri") if isinstance(obj, dict) else None
         
         if not isinstance(obj, dict):
             rejected_objects.append({"uri": None, "reasonCodes": ["SCHEMA_INVALID"]})
             continue
+
+        uri_val = obj.get("uri")
+        uri_str = uri_val if isinstance(uri_val, str) else None
         
-        uri_str = obj.get("uri")
-        if not isinstance(uri_str, str) or not re.match(r"^gs://[^/]+/.+$", uri_str):
+        # 1. URI check: gs://bucket/object (bucket cannot have /, object cannot be empty)
+        if not isinstance(uri_val, str) or not re.match(r"^gs://[^/]+/.+$", uri_val):
             obj_codes.add("URI_INVALID")
-            
+
+        # 2. Generation check
         gen = obj.get("generation")
         f_gen = obj.get("fetchedGeneration")
-        gen_valid = isinstance(gen, str) and gen.isdigit()
-        f_gen_valid = isinstance(f_gen, str) and f_gen.isdigit()
-        if not gen_valid or not f_gen_valid:
+        gen_is_dec = isinstance(gen, str) and bool(re.match(r"^\d+$", gen))
+        f_gen_is_dec = isinstance(f_gen, str) and bool(re.match(r"^\d+$", f_gen))
+
+        if not gen_is_dec or not f_gen_is_dec:
             obj_codes.add("GENERATION_INVALID")
-        if gen_valid and f_gen_valid and gen != f_gen:
+        if gen != f_gen:
             obj_codes.add("GENERATION_MISMATCH")
-            
+
+        # 3. CRC32C check
         crc = obj.get("crc32c")
         crc_syntax_valid = isinstance(crc, str) and bool(re.match(r"^[0-9a-f]{8}$", crc))
         if not crc_syntax_valid:
             obj_codes.add("CRC32C_INVALID")
-            
+
         content = obj.get("content")
-        if not isinstance(content, str):
-            obj_codes.add("SCHEMA_INVALID")
-        else:
-            if crc_syntax_valid:
-                expected_crc = crc32c_hex(content.encode("utf-8"))
-                if crc != expected_crc:
-                    obj_codes.add("CRC32C_MISMATCH")
-                    
+        if isinstance(content, str) and crc_syntax_valid:
+            expected_crc = crc32c_hex(content.encode("utf-8"))
+            if crc != expected_crc:
+                obj_codes.add("CRC32C_MISMATCH")
+
+        # 4. Schema ID check
         schema_id = obj.get("schemaId")
         if schema_id != "training-v1":
             obj_codes.add("SCHEMA_INVALID")
-            
+
+        # 5. Content check
         parsed_rows = []
-        if isinstance(content, str):
+        if not isinstance(content, str):
+            obj_codes.add("SCHEMA_INVALID")
+        else:
             lines = content.splitlines()
             non_blank_lines = [line for line in lines if line.strip() != ""]
             if len(non_blank_lines) == 0:
@@ -222,14 +226,15 @@ async def build_corpus(request: Request):
                         has_schema_err = True
                         break
                     parsed_rows.append((row, dt_event))
+                
                 if has_json_err:
                     obj_codes.add("JSONL_INVALID")
                 if has_schema_err:
                     obj_codes.add("SCHEMA_INVALID")
-        
+
         if obj_codes:
             sorted_codes = sorted(list(obj_codes), key=lambda x: x.encode("utf-8"))
-            rejected_objects.append({"uri": uri_str if isinstance(uri_str, str) else None, "reasonCodes": sorted_codes})
+            rejected_objects.append({"uri": uri_str, "reasonCodes": sorted_codes})
         else:
             lineage.append({
                 "uri": uri_str,
