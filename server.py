@@ -548,7 +548,7 @@ async def bqml_endpoint(request: Request):
         reason_codes = set()
         lineage_valid = True
 
-        if run_id not in _bqml_store:
+        if not isinstance(run_id, str) or run_id not in _bqml_store:
             lineage_valid = False
         else:
             stored = _bqml_store[run_id]
@@ -556,7 +556,7 @@ async def bqml_endpoint(request: Request):
                 lineage_valid = False
             else:
                 resp = stored["response"]
-                if resp["selectedTrialId"] != sel_trial_id or resp["datasetDigest"] != dataset_digest:
+                if resp.get("selectedTrialId") != sel_trial_id or resp.get("datasetDigest") != dataset_digest:
                     lineage_valid = False
         
         if not lineage_valid:
@@ -591,11 +591,11 @@ async def bqml_endpoint(request: Request):
         test_metric = None
         critical_slice_pass = True
 
-        if rows_valid and len(rows) > 0:
+        if rows_valid and len(rows) > 0 and "INVALID_INPUT" not in reason_codes:
             correct_total = sum(1 for r in rows if r["label"] == r["prediction"])
             test_metric = round(correct_total / len(rows), 12)
 
-            if test_metric < metric_floor:
+            if isinstance(metric_floor, (int, float)) and test_metric < metric_floor:
                 reason_codes.add("AGGREGATE_FLOOR")
 
             slice_counts = {}
@@ -606,15 +606,16 @@ async def bqml_endpoint(request: Request):
                 if r["label"] == r["prediction"]:
                     slice_correct[s] = slice_correct.get(s, 0) + 1
             
-            for req_slice, req_floor in required_slices.items():
-                if req_slice not in slice_counts:
-                    reason_codes.add(f"MISSING_SLICE:{req_slice}")
-                    critical_slice_pass = False
-                else:
-                    slice_acc = round(slice_correct[req_slice] / slice_counts[req_slice], 12)
-                    if slice_acc < req_floor:
-                        reason_codes.add(f"SLICE_FLOOR:{req_slice}")
+            if isinstance(required_slices, dict):
+                for req_slice, req_floor in required_slices.items():
+                    if req_slice not in slice_counts:
+                        reason_codes.add(f"MISSING_SLICE:{req_slice}")
                         critical_slice_pass = False
+                    else:
+                        slice_acc = round(slice_correct[req_slice] / slice_counts[req_slice], 12)
+                        if isinstance(req_floor, (int, float)) and slice_acc < req_floor:
+                            reason_codes.add(f"SLICE_FLOOR:{req_slice}")
+                            critical_slice_pass = False
         else:
             critical_slice_pass = False
 
@@ -625,13 +626,13 @@ async def bqml_endpoint(request: Request):
         sorted_codes = sorted(list(reason_codes), key=lambda x: x.encode("utf-8"))
 
         return {
-            "runId": run_id,
+            "runId": run_id if isinstance(run_id, str) else None,
             "selectedTrialId": sel_trial_id,
             "datasetDigest": dataset_digest,
             "testMetric": test_metric,
             "criticalSlicePass": critical_slice_pass,
             "decision": decision,
-            "bytesProcessed": bytes_proc,
+            "bytesProcessed": bytes_proc if isinstance(bytes_proc, int) else None,
             "reasonCodes": sorted_codes
         }
 
@@ -1666,16 +1667,16 @@ async def verify_bundle(request: Request):
             if not isinstance(files[req_f], str):
                 violations.add(f"INVALID_FILE:{req_f}")
 
-    unsafe_exts = (".bin", ".pt", ".pth", ".pkl", ".pickle")
-    for f_name in files.keys():
+    # Recompute inventory
+    recomputed_inv = []
+    has_untracked = False
+    for f_name, f_content in files.items():
         if f_name not in REQUIRED_BUNDLE_FILES:
             violations.add("UNTRACKED_FILE")
+            has_untracked = True
         if any(f_name.endswith(ext) for ext in unsafe_exts):
             violations.add("UNSAFE_WEIGHTS")
-
-    recomputed_inv = []
-    for f_name, f_content in files.items():
-        if f_name != "inventory.json" and isinstance(f_content, str):
+        if f_name != "inventory.json" and isinstance(f_content, str) and f_name in REQUIRED_BUNDLE_FILES:
             f_bytes = f_content.encode("utf-8")
             recomputed_inv.append({
                 "name": f_name,
