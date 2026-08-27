@@ -988,10 +988,13 @@ async def adapt_endpoint(request: Request):
             reason_codes.add("INFERENCE_MODE")
 
         expected_artifacts = {"adapter_config.json", "adapter_model.safetensors"}
+        full_model_names = {"model.safetensors", "pytorch_model.bin", "model.safetensors.index.json"}
         if isinstance(artifact_files, list) and set(artifact_files) == expected_artifacts and len(artifact_files) == 2:
             adapter_files = sorted(artifact_files, key=lambda x: x.encode("utf-8"))
         else:
             adapter_files = []
+            if isinstance(artifact_files, list) and any(f in full_model_names for f in artifact_files):
+                reason_codes.add("FULL_MODEL_ARTIFACT")
             reason_codes.add("ADAPTER_FILE_SET")
 
         chk_complete = True
@@ -1099,24 +1102,22 @@ async def quantize_endpoint(request: Request):
         tok_digest = body.get("tokenizerDigest")
         allowed_reasons = set(body.get("allowedUnsupportedReasons", []))
 
-        # Check global valid inputs
-        if not (isinstance(calib_digest, str) and len(calib_digest) > 0 and
-                isinstance(tok_digest, str) and len(tok_digest) > 0 and
-                isinstance(body.get("allowedUnsupportedReasons"), list)):
-            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
-
         frozen_candidates = []
         cand_names_seen = set()
 
         for c in candidates:
             if not isinstance(c, dict):
-                return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+                continue
             cname = c.get("name")
-            if not isinstance(cname, str) or len(cname) == 0 or cname in cand_names_seen:
-                return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+            c_codes = set()
+            
+            if not isinstance(cname, str) or len(cname) == 0:
+                c_codes.add("INVALID_INPUT")
+                cname = str(cname)
+            elif cname in cand_names_seen:
+                c_codes.add("INVALID_INPUT")
             cand_names_seen.add(cname)
 
-            c_codes = set()
             files = c.get("files")
             loadable = c.get("loadable")
             c_calib = c.get("calibrationDigest")
