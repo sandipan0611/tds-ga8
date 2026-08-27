@@ -477,8 +477,8 @@ async def bqml_endpoint(request: Request):
                 if not isinstance(f_obj, dict) or "availableAt" not in f_obj:
                     is_valid_f = False
                     break
-                dt_avail = parse_iso_timestamp(f_obj["availableAt"])
-                if dt_avail is None or dt_avail > r["predictionTimeDt"]:
+                dt_avail = parse_iso_timestamp(f_obj.get("availableAt"))
+                if dt_avail is None or r.get("predictionTimeDt") is None or dt_avail > r["predictionTimeDt"]:
                     is_valid_f = False
                     break
             if is_valid_f:
@@ -770,7 +770,8 @@ async def promote_endpoint(request: Request):
                 "evaluation": eval_obj
             })
 
-    eligible_versions = [v["version"] for v in version_objects]
+    ranked = sorted(version_objects, key=lambda x: (-x["accuracy"], x["latencyMs"], x["sizeBytes"], x["int_version"]))
+    eligible_versions = [v["version"] for v in ranked]
 
     champion_eligible = any(v["version"] == champion_ver for v in version_objects)
     if not champion_eligible:
@@ -784,7 +785,6 @@ async def promote_endpoint(request: Request):
             "evidence": None
         }
 
-    ranked = sorted(version_objects, key=lambda x: (-x["accuracy"], x["latencyMs"], x["sizeBytes"], x["int_version"]))
     challenger = ranked[0]
     champion_obj = next(v for v in version_objects if v["version"] == champion_ver)
 
