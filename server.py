@@ -462,7 +462,9 @@ async def bqml_endpoint(request: Request):
         forbidden_set = set(forbidden_features) if isinstance(forbidden_features, list) else set()
         all_features = set()
         for r in retained_rows:
-            all_features.update(r["features"].keys())
+            f_dict = r.get("features")
+            if isinstance(f_dict, dict):
+                all_features.update(f_dict.keys())
         
         eligible_features = []
         for f_name in all_features:
@@ -470,15 +472,17 @@ async def bqml_endpoint(request: Request):
                 continue
             is_valid_f = True
             for r in retained_rows:
-                if f_name not in r["features"]:
+                f_dict = r.get("features")
+                if not isinstance(f_dict, dict) or f_name not in f_dict:
                     is_valid_f = False
                     break
-                f_obj = r["features"][f_name]
+                f_obj = f_dict[f_name]
                 if not isinstance(f_obj, dict) or "availableAt" not in f_obj:
                     is_valid_f = False
                     break
                 dt_avail = parse_iso_timestamp(f_obj.get("availableAt"))
-                if dt_avail is None or r.get("predictionTimeDt") is None or dt_avail > r["predictionTimeDt"]:
+                p_dt = r.get("predictionTimeDt")
+                if dt_avail is None or p_dt is None or dt_avail > p_dt:
                     is_valid_f = False
                     break
             if is_valid_f:
