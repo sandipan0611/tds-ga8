@@ -1099,11 +1099,23 @@ async def quantize_endpoint(request: Request):
         tok_digest = body.get("tokenizerDigest")
         allowed_reasons = set(body.get("allowedUnsupportedReasons", []))
 
+        # Check global valid inputs
+        if not (isinstance(calib_digest, str) and len(calib_digest) > 0 and
+                isinstance(tok_digest, str) and len(tok_digest) > 0 and
+                isinstance(body.get("allowedUnsupportedReasons"), list)):
+            return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+
         frozen_candidates = []
+        cand_names_seen = set()
+
         for c in candidates:
             if not isinstance(c, dict):
-                continue
+                return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
             cname = c.get("name")
+            if not isinstance(cname, str) or len(cname) == 0 or cname in cand_names_seen:
+                return JSONResponse(status_code=400, content={"error": "INVALID_INPUT"})
+            cand_names_seen.add(cname)
+
             c_codes = set()
             files = c.get("files")
             loadable = c.get("loadable")
@@ -1120,7 +1132,7 @@ async def quantize_endpoint(request: Request):
             else:
                 file_inv = []
                 for fname, fcontent in files.items():
-                    if not isinstance(fname, str) or not isinstance(fcontent, str):
+                    if not isinstance(fname, str) or len(fname) == 0 or not isinstance(fcontent, str):
                         c_codes.add("INVALID_INPUT")
                         break
                     f_bytes = fcontent.encode("utf-8")
@@ -1136,12 +1148,12 @@ async def quantize_endpoint(request: Request):
                     total_bytes = sum(f["bytes"] for f in file_inv)
                     package_digest = sha256_hex(compact_json(inventory))
 
-            if unsup_reason:
-                if unsup_reason in allowed_reasons:
-                    status = "unsupported"
-                else:
+            if unsup_reason is not None:
+                if not isinstance(unsup_reason, str) or unsup_reason not in allowed_reasons:
                     status = "invalid"
                     c_codes.add("UNALLOWED_UNSUPPORTED_REASON")
+                else:
+                    status = "unsupported"
             else:
                 if not loadable:
                     c_codes.add("NOT_LOADABLE")
@@ -1362,16 +1374,22 @@ async def pipeline_endpoint(request: Request):
             "cacheKey": k_vd
         }
 
-        k_prep = sha256_hex(compact_json([inputs["canonicalData"], inputs["prepareCode"], inputs["prepareConfig"]]))
-        keys["prepare"] = k_prep
-        dep_digests["prepare"] = {
-            "canonicalData": inputs["canonicalData"],
-            "prepareCode": inputs["prepareCode"],
-            "prepareConfig": inputs["prepareConfig"],
-            "cacheKey": k_prep
-        }
+        # prepare requires verify_data to be reusable
+        vd_cached = session["cache"].get(k_vd)
+        if vd_cached:
+            k_prep = sha256_hex(compact_json([inputs["canonicalData"], inputs["prepareCode"], inputs["prepareConfig"]]))
+            keys["prepare"] = k_prep
+            dep_digests["prepare"] = {
+                "canonicalData": inputs["canonicalData"],
+                "prepareCode": inputs["prepareCode"],
+                "prepareConfig": inputs["prepareConfig"],
+                "cacheKey": k_prep
+            }
+        else:
+            keys["prepare"] = None
+            dep_digests["prepare"] = {}
 
-        prep_cached = session["cache"].get(k_prep)
+        prep_cached = session["cache"].get(keys.get("prepare")) if keys.get("prepare") else None
         if prep_cached:
             k_train = sha256_hex(compact_json([prep_cached["artifact"], inputs["trainCode"], inputs["trainConfig"], inputs["runtime"]]))
             keys["train"] = k_train
@@ -1667,6 +1685,8 @@ async def verify_bundle(request: Request):
             if not isinstance(files[req_f], str):
                 violations.add(f"INVALID_FILE:{req_f}")
 
+    unsafe_exts = (".bin", ".pt", ".pth", ".pkl", ".pickle")
+    
     # Recompute inventory
     recomputed_inv = []
     has_untracked = False
@@ -1687,24 +1707,28 @@ async def verify_bundle(request: Request):
     recomputed_inv_json = compact_json(recomputed_inv)
     inventory_digest = sha256_hex(recomputed_inv_json)
 
-    if "inventory.json" in files and isinstance(files["inventory.json"], str):
-        try:
-            supplied_inv = json.loads(files["inventory.json"])
-            if supplied_inv != recomputed_inv:
-                violations.add("INVENTORY_MISMATCH")
-        except Exception:
-            violations.add("INVALID_JSON:inventory.json")
+    if "inventory.json" in files:
+        f_inv = files.get("inventory.json")
+        if isinstance(f_inv, str):
+            try:
+                supplied_inv = json.loads(f_inv)
+                if supplied_inv != recomputed_inv:
+                    violations.add("INVENTORY_MISMATCH")
+            except Exception:
+                violations.add("INVALID_JSON:inventory.json")
 
-    if "adapter_config.json" in files and isinstance(files["adapter_config.json"], str):
-        try:
-            cfg = json.loads(files["adapter_config.json"])
-            if not (isinstance(cfg, dict) and isinstance(cfg.get("r"), int) and cfg.get("r") > 0 and
-                    isinstance(cfg.get("target_modules"), list) and len(cfg.get("target_modules")) > 0 and
-                    len(cfg.get("target_modules")) == len(set(cfg.get("target_modules"))) and
-                    all(isinstance(m, str) and len(m) > 0 for m in cfg.get("target_modules"))):
-                violations.add("INVALID_ADAPTER_CONFIG")
-        except Exception:
-            violations.add("INVALID_JSON:adapter_config.json")
+    if "adapter_config.json" in files:
+        f_cfg = files.get("adapter_config.json")
+        if isinstance(f_cfg, str):
+            try:
+                cfg = json.loads(f_cfg)
+                if not (isinstance(cfg, dict) and isinstance(cfg.get("r"), int) and cfg.get("r") > 0 and
+                        isinstance(cfg.get("target_modules"), list) and len(cfg.get("target_modules")) > 0 and
+                        len(cfg.get("target_modules")) == len(set(cfg.get("target_modules"))) and
+                        all(isinstance(m, str) and len(m) > 0 for m in cfg.get("target_modules"))):
+                    violations.add("INVALID_ADAPTER_CONFIG")
+            except Exception:
+                violations.add("INVALID_JSON:adapter_config.json")
 
     model_digest = None
     if "adapter_model.safetensors" in files and isinstance(files["adapter_model.safetensors"], str):
@@ -1715,84 +1739,90 @@ async def verify_bundle(request: Request):
         eval_digest = sha256_hex(files["evaluation.json"].encode("utf-8"))
 
     manifest = None
-    if "training_manifest.json" in files and isinstance(files["training_manifest.json"], str):
-        try:
-            manifest = json.loads(files["training_manifest.json"])
-            if not isinstance(manifest, dict):
-                violations.add("INVALID_TRAINING_MANIFEST")
-            else:
-                base_rev = manifest.get("baseRevision")
-                if not (isinstance(base_rev, str) and re.match(r"^[0-9a-f]{40}$", base_rev)):
-                    violations.add("MUTABLE_BASE_REVISION")
-
-                req_man_fields = ["task", "datasetDigest", "codeDigest", "trainingConfigDigest", "modelArtifactDigest", "evaluationArtifactDigest"]
-                for mf in req_man_fields:
-                    val = manifest.get(mf)
-                    if not isinstance(val, str) or len(val) == 0:
-                        violations.add(f"MISSING_MANIFEST_FIELD:{mf}")
-
-                if manifest.get("modelArtifactDigest") != model_digest:
-                    violations.add("MODEL_ARTIFACT_MISMATCH")
-                if manifest.get("evaluationArtifactDigest") != eval_digest:
-                    violations.add("EVALUATION_ARTIFACT_MISMATCH")
-        except Exception:
-            violations.add("INVALID_JSON:training_manifest.json")
-
-    if "evaluation.json" in files and isinstance(files["evaluation.json"], str):
-        try:
-            eval_data = json.loads(files["evaluation.json"])
-            if not isinstance(eval_data, dict):
-                violations.add("INVALID_EVALUATION")
-            else:
-                if eval_data.get("modelArtifactDigest") != model_digest:
-                    violations.add("EVALUATION_DIGEST_MISMATCH")
-
-                agg = eval_data.get("aggregate")
-                if not (isinstance(agg, (int, float)) and math.isfinite(agg) and 0.0 <= agg <= 1.0):
-                    violations.add("INVALID_AGGREGATE")
-
-                slices = eval_data.get("slices", {})
-                if not isinstance(slices, dict):
-                    for s in req_slices or []:
-                        violations.add(f"MISSING_SLICE:{s}")
-                else:
-                    for s in req_slices or []:
-                        if s not in slices:
-                            violations.add(f"MISSING_SLICE:{s}")
-                        else:
-                            sval = slices[s]
-                            if not (isinstance(sval, (int, float)) and math.isfinite(sval) and 0.0 <= sval <= 1.0):
-                                violations.add(f"SLICE_RANGE:{s}")
-        except Exception:
-            violations.add("INVALID_JSON:evaluation.json")
-
-    if "README.md" in files and isinstance(files["README.md"], str):
-        readme_str = files["README.md"]
-        pattern = r"<!-- tds-model-card (.*?) -->"
-        matches = re.findall(pattern, readme_str, re.DOTALL)
-        if len(matches) == 0:
-            violations.add("MODEL_CARD_COUNT")
-            violations.add("MISSING_MODEL_CARD")
-        elif len(matches) > 1:
-            violations.add("MODEL_CARD_COUNT")
-        else:
-            payload_str = matches[0].strip()
+    if "training_manifest.json" in files:
+        f_man = files.get("training_manifest.json")
+        if isinstance(f_man, str):
             try:
-                card_json = json.loads(payload_str)
-                if not isinstance(card_json, dict):
-                    violations.add("INVALID_MODEL_CARD")
+                manifest_parsed = json.loads(f_man)
+                if not isinstance(manifest_parsed, dict):
+                    violations.add("INVALID_TRAINING_MANIFEST")
                 else:
-                    if (manifest and
-                        (card_json.get("task") != manifest.get("task") or
-                         card_json.get("baseRevision") != manifest.get("baseRevision") or
-                         card_json.get("datasetDigest") != manifest.get("datasetDigest") or
-                         card_json.get("modelArtifactDigest") != manifest.get("modelArtifactDigest") or
-                         card_json.get("license") != lic or
-                         card_json.get("intendedUse") != use or
-                         card_json.get("limitations") != lim)):
-                        violations.add("MODEL_CARD_MISMATCH")
+                    manifest = manifest_parsed
+                    base_rev = manifest.get("baseRevision")
+                    if not (isinstance(base_rev, str) and re.match(r"^[0-9a-f]{40}$", base_rev)):
+                        violations.add("MUTABLE_BASE_REVISION")
+
+                    req_man_fields = ["task", "datasetDigest", "codeDigest", "trainingConfigDigest", "modelArtifactDigest", "evaluationArtifactDigest"]
+                    for mf in req_man_fields:
+                        val = manifest.get(mf)
+                        if not isinstance(val, str) or len(val) == 0:
+                            violations.add(f"MISSING_MANIFEST_FIELD:{mf}")
+
+                    if manifest.get("modelArtifactDigest") != model_digest:
+                        violations.add("MODEL_ARTIFACT_MISMATCH")
+                    if manifest.get("evaluationArtifactDigest") != eval_digest:
+                        violations.add("EVALUATION_ARTIFACT_MISMATCH")
             except Exception:
-                violations.add("INVALID_MODEL_CARD")
+                violations.add("INVALID_JSON:training_manifest.json")
+
+    if "evaluation.json" in files:
+        f_eval = files.get("evaluation.json")
+        if isinstance(f_eval, str):
+            try:
+                eval_data = json.loads(f_eval)
+                if not isinstance(eval_data, dict):
+                    violations.add("INVALID_EVALUATION")
+                else:
+                    if eval_data.get("modelArtifactDigest") != model_digest:
+                        violations.add("EVALUATION_DIGEST_MISMATCH")
+
+                    agg = eval_data.get("aggregate")
+                    if not (isinstance(agg, (int, float)) and math.isfinite(agg) and 0.0 <= agg <= 1.0):
+                        violations.add("INVALID_AGGREGATE")
+
+                    slices = eval_data.get("slices", {})
+                    if not isinstance(slices, dict):
+                        for s in req_slices or []:
+                            violations.add(f"MISSING_SLICE:{s}")
+                    else:
+                        for s in req_slices or []:
+                            if s not in slices:
+                                violations.add(f"MISSING_SLICE:{s}")
+                            else:
+                                sval = slices[s]
+                                if not (isinstance(sval, (int, float)) and math.isfinite(sval) and 0.0 <= sval <= 1.0):
+                                    violations.add(f"SLICE_RANGE:{s}")
+            except Exception:
+                violations.add("INVALID_JSON:evaluation.json")
+
+    if "README.md" in files:
+        readme_str = files.get("README.md")
+        if isinstance(readme_str, str):
+            pattern = r"<!-- tds-model-card (.*?) -->"
+            matches = re.findall(pattern, readme_str, re.DOTALL)
+            if len(matches) == 0:
+                violations.add("MODEL_CARD_COUNT")
+                violations.add("MISSING_MODEL_CARD")
+            elif len(matches) > 1:
+                violations.add("MODEL_CARD_COUNT")
+            else:
+                payload_str = matches[0].strip()
+                try:
+                    card_json = json.loads(payload_str)
+                    if not isinstance(card_json, dict):
+                        violations.add("INVALID_MODEL_CARD")
+                    else:
+                        if (manifest and
+                            (card_json.get("task") != manifest.get("task") or
+                             card_json.get("baseRevision") != manifest.get("baseRevision") or
+                             card_json.get("datasetDigest") != manifest.get("datasetDigest") or
+                             card_json.get("modelArtifactDigest") != manifest.get("modelArtifactDigest") or
+                             card_json.get("license") != lic or
+                             card_json.get("intendedUse") != use or
+                             card_json.get("limitations") != lim)):
+                            violations.add("MODEL_CARD_MISMATCH")
+                except Exception:
+                    violations.add("INVALID_MODEL_CARD")
 
     decision = "admit" if len(violations) == 0 else "reject"
     sorted_violations = sorted(list(violations), key=lambda x: x.encode("utf-8"))
